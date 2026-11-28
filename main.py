@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramAPIError
 from database import Database
 from ai_provider import AIConfig, AIError, generate
 from image_provider import ImageConfig, generate_image
+from mini_app import parse_payload, safe_webapp_url
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -44,7 +45,11 @@ def keyboard(*rows):
 
 
 def menu():
-    return keyboard((CHAT, STUDIO), (CATALOG, HISTORY), (PROFILE, WALLET), (HELP,))
+    markup = keyboard((CHAT, STUDIO), (CATALOG, HISTORY), (PROFILE, WALLET), (HELP,))
+    app_url = safe_webapp_url(os.getenv("MINI_APP_URL", ""))
+    if app_url:
+        markup.keyboard.insert(0, [types.KeyboardButton(text="🚀 Открыть CraftToken", web_app=types.WebAppInfo(url=app_url))])
+    return markup
 
 
 def available_routes(user_id):
@@ -494,6 +499,29 @@ async def disable_ai(message: types.Message):
 @router.message(F.text.startswith("/"))
 async def unknown_command(message: types.Message):
     await message.answer("Неизвестная команда. Используй /menu.")
+
+
+@router.message(F.web_app_data)
+async def mini_app_data(message: types.Message):
+    """Accept only navigation/demo data. Never trust client-side balance or prices."""
+    try:
+        payload = parse_payload(message.web_app_data.data)
+        action = payload["action"]
+        if action == "open_chat":
+            await chat(message)
+            return
+        if action == "open_profile":
+            await profile(message)
+            return
+        if action == "preview":
+            prompt, ratio = payload["prompt"], payload["ratio"]
+            register(message.from_user)
+            navigate(message.from_user.id, "studio")
+            await message.answer(f"🎨 Черновик из CraftToken Mini App\n\nИдея: {prompt.strip()}\nФормат: {ratio}\n\nДЕМО: изображение не создано, внешних запросов и списаний нет.", reply_markup=menu())
+            return
+    except (ValueError, TypeError, UnicodeError):
+        pass
+    await message.answer("Данные приложения не приняты. Открой CraftToken снова.", reply_markup=menu())
 
 
 @router.message(F.text)
