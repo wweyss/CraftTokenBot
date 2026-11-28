@@ -1,160 +1,310 @@
-import os
+"""CraftToken: free-only AI test with a local demo fallback; no payments."""
 import asyncio
 import logging
-import aiosqlite
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+import os
+
+from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.filters import Command, CommandStart
+
+from database import Database
+from ai_provider import AIConfig, AIError, generate
 
 logging.basicConfig(level=logging.INFO)
+router = Router()
+router.message.filter(F.chat.type == "private")
+router.callback_query.filter(F.message.chat.type == "private")
+db = Database(os.getenv("DB_PATH", "bot_database.db"))
+ai_config = None
+busy = set()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-# Укажите ваш цифровой Telegram ID (можно узнать в боте @userinfobot)
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+CHAT = "💬 AI-диалоги"
+STUDIO = "🎨 AI-студия"
+HISTORY = "🗂 Моя история"
+WALLET = "💎 Мой баланс"
+HELP = "🛟 Помощь"
+HOME = "🏠 Главное меню"
+MODES = {"fast": "⚡ Быстрый", "creative": "✨ Творческий"}
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
 
-DB_NAME = "bot_database.db"
+def keyboard(*rows):
+    return types.ReplyKeyboardMarkup(
+        keyboard=[[types.KeyboardButton(text=label) for label in row] for row in rows],
+        resize_keyboard=True,
+    )
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ ---
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                tokens INTEGER DEFAULT 100
-            )
-        """)
-        await db.commit()
 
-async def get_or_create_user(user_id: int, username: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT tokens FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        if row is None:
-            # Даем 100 бесплатных токенов при первом входе
-            await db.execute(
-                "INSERT INTO users (user_id, username, tokens) VALUES (?, ?, ?)",
-                (user_id, username, 100)
-            )
-            await db.commit()
-            return 100
-        return row[0]
+def menu():
+    return keyboard((CHAT, STUDIO), (HISTORY, WALLET), (HELP,))
 
-async def update_tokens(user_id: int, amount: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
-            (amount, user_id)
-        )
-        await db.commit()
 
-# --- КЛАВИАТУРЫ ---
-def main_menu_kb():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Купить токены", callback_data="buy_menu")
-    builder.button(text="👤 Мой баланс", callback_data="profile")
-    builder.adjust(1)
-    return builder.as_markup()
+def chat_buttons(mode):
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text=("✓ " if mode == key else "") + label, callback_data=f"mode:{key}") for key, label in MODES.items()],
+        [types.InlineKeyboardButton(text="➕ Новый диалог", callback_data="dialog:new")],
+    ])
 
-# --- ХЕНДЛЕРЫ (РЕАКЦИИ БОТА) ---
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    tokens = await get_or_create_user(message.from_user.id, message.from_user.username)
+
+def register(user):
+    return db.ensure_user(user.id, user.username)
+
+
+async def welcome(message):
+    balance = register(message.from_user)
     await message.answer(
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        f"Я AI-бот. Просто напиши мне любой вопрос, и я отвечу с помощью нейросети.\n"
-        f"🎁 Ваш текущий баланс: <b>{tokens} токенов</b>.",
-        reply_markup=main_menu_kb(),
-        parse_mode="HTML"
+        f"⚡ CraftToken AI\n\nТвой персональный набор AI-инструментов.\n"
+        f"Баланс: {balance} CT\n\n"
+        + ("Тестовая версия. Для подключения реального AI используй /ai_on.\n" if ai_config and message.from_user.id in ai_config.testers else "Тестовая версия: демонстрационный режим.\n")
+        + "Платежи отключены, CT не имеют денежной стоимости.\n"
+        "Выбери раздел или отправь текст для теста.",
+        reply_markup=menu(),
     )
 
-@dp.callback_query(F.data == "profile")
-async def show_profile(callback: types.CallbackQuery):
-    tokens = await get_or_create_user(callback.from_user.id, callback.from_user.username)
-    await callback.message.edit_text(
-        f"👤 <b>Личный кабинет</b>\n\n"
-        f"🆔 Ваш ID: <code>{callback.from_user.id}</code>\n"
-        f"💎 Баланс: <b>{tokens} токенов</b>",
-        reply_markup=main_menu_kb(),
-        parse_mode="HTML"
+
+@router.message(CommandStart())
+@router.message(Command("menu"))
+@router.message(F.text == HOME)
+async def start(message: types.Message):
+    await welcome(message)
+
+
+@router.message(F.text == CHAT)
+async def chat(message: types.Message):
+    register(message.from_user)
+    mode = db.mode(message.from_user.id)
+    await message.answer(
+        f"💬 AI-диалоги\nРежим: {MODES[mode]}\n\n"
+        + ("Тестовый маршрут настроен. /ai_on — включить, /ai_off — выключить." if ai_config and message.from_user.id in ai_config.testers else "Демонстрационный режим: бесплатный тест интерфейса."),
+        reply_markup=chat_buttons(mode),
     )
+
+
+@router.callback_query(F.data.in_({"mode:fast", "mode:creative"}))
+async def select_mode(callback: types.CallbackQuery):
+    register(callback.from_user)
+    mode = callback.data.split(":")[1]
+    db.set_mode(callback.from_user.id, mode)
+    await callback.answer(f"Выбран {MODES[mode]}")
+    if callback.message.reply_markup != chat_buttons(mode):
+        await callback.message.edit_reply_markup(reply_markup=chat_buttons(mode))
+
+
+@router.callback_query(F.data == "dialog:new")
+async def new_dialog(callback: types.CallbackQuery):
+    register(callback.from_user)
+    if callback.from_user.id in busy:
+        await callback.answer("Дождись завершения запроса.", show_alert=True)
+        return
+    db.new_dialog(callback.from_user.id)
+    await callback.answer("Новый диалог создан")
+    await callback.message.answer("Новый диалог. Отправь текст для теста.", reply_markup=menu())
+
+
+@router.message(F.text == STUDIO)
+async def studio(message: types.Message):
+    register(message.from_user)
+    await message.answer(
+        "🎨 AI-студия\n\nВ разработке: генерация изображений и редактирование фото. "
+        "В текущей версии файлы не отправляются внешним сервисам.",
+        reply_markup=menu(),
+    )
+
+
+@router.message(F.text == WALLET)
+@router.message(Command("balance"))
+async def wallet(message: types.Message):
+    balance = register(message.from_user)
+    entries = db.ledger(message.from_user.id)
+    operations = "\n".join(f"{r['amount']:+d} CT — {r['reason']}" for r in entries)
+    await message.answer(
+        f"💎 Мой баланс\n\nДоступно: {balance} CT\nTelegram ID: {message.from_user.id}\n"
+        "Тестовые кредиты. Пополнение за деньги отключено.\n\n"
+        "Последние операции:\n" + (operations or "Нет новых операций."),
+        reply_markup=menu(),
+    )
+
+
+@router.message(F.text == HISTORY)
+async def history(message: types.Message):
+    register(message.from_user)
+    prompts = db.recent_prompts(message.from_user.id)
+    lines = [f"• {r['content'][:180]}" for r in prompts]
+    await message.answer(
+        "🗂 Последние запросы\n\n" + ("\n".join(lines) if lines else "Пока пусто.") +
+        "\n\nУдалить историю: /clear_history", reply_markup=menu(),
+    )
+
+
+@router.message(Command("clear_history"))
+async def clear_history(message: types.Message):
+    register(message.from_user)
+    await message.answer("Удалить все сохранённые тексты твоих диалогов?", reply_markup=types.InlineKeyboardMarkup(
+        inline_keyboard=[[types.InlineKeyboardButton(text="Удалить", callback_data="history:delete"),
+                          types.InlineKeyboardButton(text="Отмена", callback_data="history:cancel")]]
+    ))
+
+
+@router.callback_query(F.data.in_({"history:delete", "history:cancel"}))
+async def confirm_clear(callback: types.CallbackQuery):
+    register(callback.from_user)
+    if callback.data == "history:delete":
+        if callback.from_user.id in busy:
+            await callback.answer("Дождись завершения запроса.", show_alert=True)
+            return
+        db.clear_history(callback.from_user.id)
+        text = "История удалена. Баланс не изменён."
+    else:
+        text = "Удаление отменено."
     await callback.answer()
+    await callback.message.edit_text(text)
 
-@dp.callback_query(F.data == "buy_menu")
-async def show_buy_menu(callback: types.CallbackQuery):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="1 000 токенов — 100 ₽", callback_data="test_pay_1000")
-    builder.button(text="5 000 токенов — 400 ₽", callback_data="test_pay_5000")
-    builder.button(text="⬅️ Назад", callback_data="back_main")
-    builder.adjust(1)
 
-    await callback.message.edit_text(
-        "💳 <b>Выберите пакет токенов:</b>\n\n"
-        "<i>(Пока работает в тестовом режиме — начисляет без оплаты)</i>",
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
+@router.message(F.text == HELP)
+@router.message(Command("help"))
+async def help_message(message: types.Message):
+    register(message.from_user)
+    contact = os.getenv("SUPPORT_CONTACT", "").strip()
+    await message.answer(
+        "🛟 Помощь\n\n/menu — главное меню\n/balance — баланс\n"
+        "/clear_history — удалить историю из базы бота\n\n"
+        "/ai_on — включить реальный AI (для тестировщиков)\n/ai_off — выключить AI\n"
+        "Запросы сохраняются в базе. При включённом AI текст и контекст отправляются GetAPI и его провайдеру. Не отправляй пароли и личные данные. "
+        "Удаление в боте не удаляет сообщения из Telegram.\n" +
+        (f"Поддержка: {contact}" if contact else "Контакт поддержки ещё не настроен."),
+        reply_markup=menu(),
     )
-    await callback.answer()
 
-@dp.callback_query(F.data == "back_main")
-async def back_to_main(callback: types.CallbackQuery):
-    tokens = await get_or_create_user(callback.from_user.id, callback.from_user.username)
-    await callback.message.edit_text(
-        f"Главное меню.\n💎 Ваш баланс: <b>{tokens} токенов</b>.",
-        reply_markup=main_menu_kb(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
 
-# Тестовое пополнение баланса
-@dp.callback_query(F.data.startswith("test_pay_"))
-async def process_test_pay(callback: types.CallbackQuery):
-    amount = int(callback.data.split("_")[2])
-    await update_tokens(callback.from_user.id, amount)
-    new_balance = await get_or_create_user(callback.from_user.id, callback.from_user.username)
-    
-    await callback.message.edit_text(
-        f"✅ Успешно начислено <b>{amount} токенов</b>!\n"
-        f"💎 Текущий баланс: <b>{new_balance} токенов</b>.",
-        reply_markup=main_menu_kb(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-# Админ-команда для ручной выдачи: /add ID КОЛИЧЕСТВО
-@dp.message(Command("add"))
-async def admin_add_tokens(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+@router.message(Command("add"))
+async def admin_add(message: types.Message):
+    admin_ids = {x.strip() for x in os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", "")).split(",")}
+    if str(message.from_user.id) not in admin_ids:
+        await message.answer("Команда недоступна.")
         return
     try:
-        _, user_id, amount = message.text.split()
-        await update_tokens(int(user_id), int(amount))
-        await message.answer(f"✅ Пользователю {user_id} начислено {amount} токенов.")
-    except Exception:
-        await message.answer("❌ Ошибка формата. Используйте: `/add 123456789 500`", parse_mode="Markdown")
-
-# Заглушка для будущего чата с нейросетью
-@dp.message(F.text)
-async def handle_ai_request(message: types.Message):
-    tokens = await get_or_create_user(message.from_user.id, message.from_user.username)
-    if tokens < 10:
-        await message.answer("❌ Недостаточно токенов! Пополните баланс в меню.", reply_markup=main_menu_kb())
+        _, raw_id, raw_amount = message.text.split()
+        user_id, amount = int(raw_id), int(raw_amount)
+        if not (0 < user_id < 2**63 and 0 < amount <= 1_000_000):
+            raise ValueError
+    except ValueError:
+        await message.answer("Формат: /add ID КОЛИЧЕСТВО (1–1000000).")
         return
-    
-    # Пока просто списываем 10 токенов за сообщение
-    await update_tokens(message.from_user.id, -10)
+    if db.change_balance(user_id, amount, "Начисление администратора"):
+        await message.answer(f"Начислено {amount} CT пользователю {user_id}.")
+    else:
+        await message.answer("Пользователь не найден.")
+
+
+@router.message(Command("ai_on"))
+async def enable_ai(message: types.Message):
+    user_id = message.from_user.id
+    register(message.from_user)
+    if not ai_config or user_id not in ai_config.testers:
+        await message.answer("Реальный AI пока доступен только участникам закрытого теста.")
+        return
     await message.answer(
-        f"🤖 <i>[Тут скоро будет ответ нейросети на ваш запрос: «{message.text}»]</i>\n\n"
-        f"Списано: 10 токенов. Остаток: <b>{tokens - 10}</b>",
-        parse_mode="HTML"
+        "Включить AI? Текст запроса и до 6 предыдущих AI-сообщений будут передаваться "
+        "GetAPI и выбранному поставщику. Данные могут обрабатываться по их правилам. "
+        "Не отправляй личные данные. Условия: https://getapi.ru/offer. Тест на ограниченном бюджете; CT не списываются.",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="Согласен, включить", callback_data="ai:enable")],
+            [types.InlineKeyboardButton(text="Отмена", callback_data="ai:disable")],
+        ]),
     )
 
+
+@router.callback_query(F.data.in_({"ai:enable", "ai:disable"}))
+async def toggle_ai(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    register(callback.from_user)
+    if callback.data == "ai:enable" and (not ai_config or user_id not in ai_config.testers):
+        await callback.answer("AI недоступен.", show_alert=True)
+        return
+    if user_id in busy:
+        await callback.answer("Дождись завершения текущего запроса.", show_alert=True)
+        return
+    enabled = callback.data == "ai:enable"
+    db.set_ai_enabled(user_id, enabled)
+    await callback.answer()
+    await callback.message.edit_text("AI включён. Отправь сообщение." if enabled else "AI выключен.")
+
+
+@router.message(Command("ai_off"))
+async def disable_ai(message: types.Message):
+    user_id = message.from_user.id
+    register(message.from_user)
+    if user_id in busy:
+        await message.answer("Дождись завершения текущего запроса.")
+        return
+    db.set_ai_enabled(user_id, False)
+    await message.answer("AI выключен. Запросы больше не отправляются внешнему провайдеру.")
+
+
+@router.message(F.text.startswith("/"))
+async def unknown_command(message: types.Message):
+    await message.answer("Неизвестная команда. Используй /menu.")
+
+
+@router.message(F.text)
+async def demo(message: types.Message):
+    register(message.from_user)
+    if len(message.text) > 3000:
+        await message.answer("Для теста отправь не более 3000 символов.")
+        return
+    user_id = message.from_user.id
+    mode = db.mode(user_id)
+    if ai_config and user_id in ai_config.testers and db.ai_enabled(user_id):
+        if user_id in busy:
+            await message.answer("Подожди, предыдущий запрос ещё выполняется.")
+            return
+        if not db.reserve_ai_attempt(user_id, total_limit=4 if ai_config.trial else 40, personal_limit=2 if ai_config.trial else 10):
+            await message.answer("Лимит тестовых запросов исчерпан. Попробуй позже.")
+            return
+        busy.add(user_id)
+        try:
+            await message.answer("⏳ Запрос отправлен в AI…")
+            context = db.ai_context(user_id)
+            if ai_config.trial:
+                context = [{"role": x["role"], "content": x["content"][:1000]} for x in context]
+            answer = await generate(ai_config, mode, context, message.text)
+            # Telegram's 4096-unit message limit; split conservatively for emoji.
+            for i in range(0, len(answer), 1800):
+                await message.answer(answer[i:i+1800], reply_markup=menu())
+            db.save_exchange(user_id, message.text, answer, kind="ai")
+        except AIError as error:
+            await message.answer(str(error), reply_markup=menu())
+        finally:
+            busy.discard(user_id)
+        return
+    reply = (
+        f"🧪 Демо · {MODES[mode]}\n\nЗапрос принят. Это тест интерфейса, "
+        "а не ответ нейросети. Настоящий AI пока не подключён. CT не списаны."
+    )
+    await message.answer(reply, reply_markup=menu())
+    db.save_exchange(message.from_user.id, message.text, reply)
+
+
+@router.message()
+async def other_media(message: types.Message):
+    await message.answer("В этой тестовой версии принимается только текст.", reply_markup=menu())
+
+
+@router.callback_query()
+async def old_button(callback: types.CallbackQuery):
+    await callback.answer("Кнопка устарела. Открой /menu.", show_alert=True)
+
+
 async def main():
-    await init_db()
-    await dp.start_polling(bot)
+    global ai_config
+    ai_config = AIConfig.from_env()
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("Set BOT_TOKEN in the environment")
+    db.init()
+    dispatcher = Dispatcher()
+    dispatcher.include_router(router)
+    async with Bot(token=token) as bot:
+        await dispatcher.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
