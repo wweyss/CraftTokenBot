@@ -52,6 +52,8 @@ class Database:
             """)
             if "ai_enabled" not in {r["name"] for r in db.execute("PRAGMA table_info(preferences)")}:
                 db.execute("ALTER TABLE preferences ADD COLUMN ai_enabled INTEGER NOT NULL DEFAULT 0")
+            if "model_slot" not in {r["name"] for r in db.execute("PRAGMA table_info(preferences)")}:
+                db.execute("ALTER TABLE preferences ADD COLUMN model_slot TEXT NOT NULL DEFAULT 'primary'")
             if "kind" not in {r["name"] for r in db.execute("PRAGMA table_info(messages)")}:
                 db.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'demo'")
 
@@ -137,6 +139,22 @@ class Database:
     def set_ai_enabled(self, user_id: int, enabled: bool):
         with self.connect() as db:
             db.execute("UPDATE preferences SET ai_enabled=? WHERE user_id=?", (int(enabled), user_id))
+
+    def model_slot(self, user_id: int) -> str:
+        with self.connect() as db:
+            return db.execute("SELECT model_slot FROM preferences WHERE user_id=?", (user_id,)).fetchone()[0]
+
+    def select_model(self, user_id: int, slot: str) -> bool:
+        """A different provider needs fresh consent and an isolated new dialog."""
+        if slot not in ("primary", "gpt"):
+            raise ValueError("Unknown model slot")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT model_slot FROM preferences WHERE user_id=?", (user_id,)).fetchone()[0] == slot:
+                return False
+            dialog = db.execute("INSERT INTO dialogs(user_id) VALUES (?)", (user_id,)).lastrowid
+            db.execute("UPDATE preferences SET model_slot=?, dialog_id=?, ai_enabled=0 WHERE user_id=?", (slot, dialog, user_id))
+            return True
 
     def ai_context(self, user_id: int):
         with self.connect() as db:

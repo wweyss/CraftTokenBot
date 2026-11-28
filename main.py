@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command, CommandStart
@@ -13,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 router = Router()
 router.message.filter(F.chat.type == "private")
 router.callback_query.filter(F.message.chat.type == "private")
-db = Database(os.getenv("DB_PATH", "bot_database.db"))
+db = Database(os.getenv("DB_PATH") or str(Path(os.getenv("DATA_DIR", ".")) / "bot_database.db"))
 ai_config = None
 busy = set()
 
@@ -37,8 +38,19 @@ def menu():
     return keyboard((CHAT, STUDIO), (HISTORY, WALLET), (HELP,))
 
 
-def chat_buttons(mode):
-    return types.InlineKeyboardMarkup(inline_keyboard=[
+def available_routes(user_id):
+    return ai_config.routes() if ai_config and user_id in ai_config.testers else {}
+
+
+def model_name(config):
+    return {"mistral-nemo": "Mistral Nemo", "gpt-oss-20b": "GPT-OSS-20B"}.get(config.model, config.model)
+
+
+def chat_buttons(mode, user_id):
+    routes = available_routes(user_id)
+    slot = db.model_slot(user_id)
+    rows = [[types.InlineKeyboardButton(text=("✓ " if slot == key else "") + model_name(config), callback_data=f"model:{key}")] for key, config in routes.items()]
+    return types.InlineKeyboardMarkup(inline_keyboard=rows + [
         [types.InlineKeyboardButton(text=("✓ " if mode == key else "") + label, callback_data=f"mode:{key}") for key, label in MODES.items()],
         [types.InlineKeyboardButton(text="➕ Новый диалог", callback_data="dialog:new")],
     ])
@@ -70,11 +82,14 @@ async def start(message: types.Message):
 @router.message(F.text == CHAT)
 async def chat(message: types.Message):
     register(message.from_user)
-    mode = db.mode(message.from_user.id)
+    user_id = message.from_user.id
+    mode = db.mode(user_id)
+    routes = available_routes(user_id)
+    selected = routes.get(db.model_slot(user_id))
     await message.answer(
         f"💬 AI-диалоги\nРежим: {MODES[mode]}\n\n"
-        + ("Тестовый маршрут настроен. /ai_on — включить, /ai_off — выключить." if ai_config and message.from_user.id in ai_config.testers else "Демонстрационный режим: бесплатный тест интерфейса."),
-        reply_markup=chat_buttons(mode),
+        + (f"Модель: {model_name(selected)}\n/ai_on — включить, /ai_off — выключить." if selected else "Выбери доступную модель." if routes else "Демонстрационный режим: бесплатный тест интерфейса."),
+        reply_markup=chat_buttons(mode, user_id),
     )
 
 
@@ -84,8 +99,29 @@ async def select_mode(callback: types.CallbackQuery):
     mode = callback.data.split(":")[1]
     db.set_mode(callback.from_user.id, mode)
     await callback.answer(f"Выбран {MODES[mode]}")
-    if callback.message.reply_markup != chat_buttons(mode):
-        await callback.message.edit_reply_markup(reply_markup=chat_buttons(mode))
+    buttons = chat_buttons(mode, callback.from_user.id)
+    if callback.message.reply_markup != buttons:
+        await callback.message.edit_reply_markup(reply_markup=buttons)
+
+
+@router.callback_query(F.data.in_({"model:primary", "model:gpt"}))
+async def select_model(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    register(callback.from_user)
+    slot = callback.data.split(":")[1]
+    config = available_routes(user_id).get(slot)
+    if not config or user_id in busy:
+        await callback.answer("Модель недоступна или выполняется запрос.", show_alert=True)
+        return
+    changed = db.select_model(user_id, slot)
+    await callback.answer(f"Выбрана {model_name(config)}")
+    if not changed:
+        return
+    await callback.message.edit_text(
+        f"💬 AI-диалоги\nМодель: {model_name(config)}\nРежим: {MODES[db.mode(user_id)]}\n\n"
+        + "Новый диалог. Подтверди отправку данных командой /ai_on.",
+        reply_markup=chat_buttons(db.mode(user_id), user_id),
+    )
 
 
 @router.callback_query(F.data == "dialog:new")
@@ -198,31 +234,35 @@ async def admin_add(message: types.Message):
 async def enable_ai(message: types.Message):
     user_id = message.from_user.id
     register(message.from_user)
-    if not ai_config or user_id not in ai_config.testers:
+    slot = db.model_slot(user_id)
+    config = available_routes(user_id).get(slot)
+    if not config:
         await message.answer("Реальный AI пока доступен только участникам закрытого теста.")
         return
     await message.answer(
         "Включить AI? Текст запроса и до 6 предыдущих AI-сообщений будут передаваться "
-        "GetAPI и выбранному поставщику. Данные могут обрабатываться по их правилам. "
+        f"GetAPI и поставщику {', '.join(config.providers)} (модель {model_name(config)}). Данные могут обрабатываться по их правилам. "
         "Не отправляй личные данные. Условия: https://getapi.ru/offer. Тест на ограниченном бюджете; CT не списываются.",
         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="Согласен, включить", callback_data="ai:enable")],
+            [types.InlineKeyboardButton(text="Согласен, включить", callback_data=f"ai:enable:{slot}")],
             [types.InlineKeyboardButton(text="Отмена", callback_data="ai:disable")],
         ]),
     )
 
 
-@router.callback_query(F.data.in_({"ai:enable", "ai:disable"}))
+@router.callback_query(F.data.in_({"ai:enable", "ai:enable:primary", "ai:enable:gpt", "ai:disable"}))
 async def toggle_ai(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     register(callback.from_user)
-    if callback.data == "ai:enable" and (not ai_config or user_id not in ai_config.testers):
+    enabled = callback.data != "ai:disable"
+    slot = db.model_slot(user_id)
+    expected = "primary" if callback.data == "ai:enable" else callback.data.rsplit(":", 1)[-1]
+    if enabled and (expected != slot or slot not in available_routes(user_id)):
         await callback.answer("AI недоступен.", show_alert=True)
         return
     if user_id in busy:
         await callback.answer("Дождись завершения текущего запроса.", show_alert=True)
         return
-    enabled = callback.data == "ai:enable"
     db.set_ai_enabled(user_id, enabled)
     await callback.answer()
     await callback.message.edit_text("AI включён. Отправь сообщение." if enabled else "AI выключен.")
@@ -252,20 +292,21 @@ async def demo(message: types.Message):
         return
     user_id = message.from_user.id
     mode = db.mode(user_id)
-    if ai_config and user_id in ai_config.testers and db.ai_enabled(user_id):
+    config = available_routes(user_id).get(db.model_slot(user_id))
+    if config and db.ai_enabled(user_id):
         if user_id in busy:
             await message.answer("Подожди, предыдущий запрос ещё выполняется.")
             return
-        if not db.reserve_ai_attempt(user_id, total_limit=4 if ai_config.trial else 40, personal_limit=2 if ai_config.trial else 10):
+        if not db.reserve_ai_attempt(user_id, total_limit=4 if config.trial else 40, personal_limit=2 if config.trial else 10):
             await message.answer("Лимит тестовых запросов исчерпан. Попробуй позже.")
             return
         busy.add(user_id)
         try:
-            await message.answer("⏳ Запрос отправлен в AI…")
+            await message.answer(f"⏳ {model_name(config)} готовит ответ…")
             context = db.ai_context(user_id)
-            if ai_config.trial:
+            if config.trial:
                 context = [{"role": x["role"], "content": x["content"][:1000]} for x in context]
-            answer = await generate(ai_config, mode, context, message.text)
+            answer = await generate(config, mode, context, message.text)
             # Telegram's 4096-unit message limit; split conservatively for emoji.
             for i in range(0, len(answer), 1800):
                 await message.answer(answer[i:i+1800], reply_markup=menu())

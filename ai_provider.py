@@ -1,7 +1,7 @@
 """GetAPI integration with explicitly opted-in, capped trial routes."""
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import aiohttp
 
@@ -19,6 +19,13 @@ class AIConfig:
     providers: tuple[str, ...]
     testers: frozenset[int]
     trial: bool = False
+    gpt_provider: str = ""
+
+    def routes(self):
+        routes = {"primary": self}
+        if self.gpt_provider and self.trial:
+            routes["gpt"] = replace(self, model="gpt-oss-20b", providers=(self.gpt_provider,), gpt_provider="")
+        return routes
 
     @classmethod
     def from_env(cls):
@@ -29,7 +36,8 @@ class AIConfig:
         if not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,150}", model):
             raise ValueError("GETAPI_MODEL must be an explicit catalog model ID")
         providers = tuple(x.strip() for x in os.getenv("GETAPI_PROVIDERS", "").split(",") if x.strip())
-        if not providers:            raise ValueError("GETAPI_PROVIDERS must name approved model providers")
+        if not providers:
+            raise ValueError("GETAPI_PROVIDERS must name approved model providers")
         try:
             testers = frozenset(int(x) for x in os.getenv("TEST_USER_IDS", "").split(",") if x.strip())
         except ValueError:
@@ -40,7 +48,10 @@ class AIConfig:
         trial_value = os.getenv("GETAPI_TRIAL_ONLY", "0")
         if trial_value not in {"0", "1"}:
             raise ValueError("GETAPI_TRIAL_ONLY must be 0 or 1")
-        return cls(key, model, providers, testers, trial=trial_value == "1")
+        gpt_provider = os.getenv("GETAPI_GPT_OSS_PROVIDER", "").strip()
+        if gpt_provider and (gpt_provider != "darkbloom" or trial_value != "1"):
+            raise ValueError("GPT-OSS trial requires darkbloom and GETAPI_TRIAL_ONLY=1")
+        return cls(key, model, providers, testers, trial=trial_value == "1", gpt_provider=gpt_provider)
 
 
 def request_body(config: AIConfig, mode: str, context: list[dict], prompt: str):
@@ -58,17 +69,21 @@ def request_body(config: AIConfig, mode: str, context: list[dict], prompt: str):
         identity + "Предлагай оригинальные идеи и варианты, когда это полезно."
     )
     ceiling = 0.05 if config.trial else 0
-    return {
+    is_gpt = config.model == "gpt-oss-20b"
+    body = {
         "model": config.model,
         "messages": [{"role": "system", "content": instruction}, *context, {"role": "user", "content": prompt}],
-        "max_tokens": 400,
+        "max_tokens": 600 if is_gpt else 400,
         "stream": False,
         "provider": {
             "only": list(config.providers),
             "allow_fallbacks": False,
-            "max_price": {"prompt": ceiling, "completion": ceiling},
+            "max_price": {"prompt": ceiling, "completion": 0.10 if is_gpt and config.trial else ceiling},
         },
     }
+    if is_gpt:
+        body["reasoning"] = {"effort": "low"}
+    return body
 
 
 async def generate(config: AIConfig, mode: str, context: list[dict], prompt: str) -> str:
