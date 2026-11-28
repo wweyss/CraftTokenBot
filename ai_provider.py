@@ -1,4 +1,35 @@
-            raise ValueError("GETAPI_PROVIDERS must name approved model providers")
+"""GetAPI integration with explicitly opted-in, capped trial routes."""
+import os
+import re
+from dataclasses import dataclass, field
+
+import aiohttp
+
+URL = "https://api.getapi.ru/v1/chat/completions"
+
+
+class AIError(Exception):
+    """A safe, user-facing error; never include credentials or raw API body."""
+
+
+@dataclass(frozen=True)
+class AIConfig:
+    api_key: str = field(repr=False)
+    model: str
+    providers: tuple[str, ...]
+    testers: frozenset[int]
+    trial: bool = False
+
+    @classmethod
+    def from_env(cls):
+        key = os.getenv("GETAPI_API_KEY", "").strip()
+        if not key:
+            return None
+        model = os.getenv("GETAPI_MODEL", "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,150}", model):
+            raise ValueError("GETAPI_MODEL must be an explicit catalog model ID")
+        providers = tuple(x.strip() for x in os.getenv("GETAPI_PROVIDERS", "").split(",") if x.strip())
+        if not providers:            raise ValueError("GETAPI_PROVIDERS must name approved model providers")
         try:
             testers = frozenset(int(x) for x in os.getenv("TEST_USER_IDS", "").split(",") if x.strip())
         except ValueError:
