@@ -1,4 +1,4 @@
-"""CraftToken: free-only AI test with a local demo fallback; no payments."""
+"""CraftToken: product navigation and opt-in AI trials; no payments."""
 import asyncio
 import logging
 import os
@@ -22,6 +22,7 @@ db = Database(os.getenv("DB_PATH") or str(Path(os.getenv("DATA_DIR", ".")) / "bo
 ai_config = None
 image_config = None
 image_drafts = {}
+preview_drafts = {}
 busy = set()
 
 CHAT = "💬 AI-диалоги"
@@ -29,6 +30,8 @@ STUDIO = "🎨 AI-студия"
 HISTORY = "🗂 Моя история"
 WALLET = "💎 Мой баланс"
 HELP = "🛟 Помощь"
+CATALOG = "🧠 Каталог моделей"
+PROFILE = "👤 Мой профиль"
 HOME = "🏠 Главное меню"
 MODES = {"fast": "⚡ Быстрый", "creative": "✨ Творческий"}
 
@@ -41,7 +44,7 @@ def keyboard(*rows):
 
 
 def menu():
-    return keyboard((CHAT, STUDIO), (HISTORY, WALLET), (HELP,))
+    return keyboard((CHAT, STUDIO), (CATALOG, HISTORY), (PROFILE, WALLET), (HELP,))
 
 
 def available_routes(user_id):
@@ -66,15 +69,23 @@ def register(user):
     return db.ensure_user(user.id, user.username)
 
 
+def navigate(uid, section):
+    db.set_section(uid, section)
+    image_drafts.pop(uid, None)
+    preview_drafts.pop(uid, None)
+
+
 async def welcome(message):
     image_drafts.pop(message.from_user.id, None)
+    preview_drafts.pop(message.from_user.id, None)
     balance = register(message.from_user)
+    navigate(message.from_user.id, "home")
     await message.answer(
-        f"⚡ CraftToken AI\n\nТвой персональный набор AI-инструментов.\n"
-        f"Баланс: {balance} CT\n\n"
-        + ("Тестовая версия. Для подключения реального AI используй /ai_on.\n" if ai_config and message.from_user.id in ai_config.testers else "Тестовая версия: демонстрационный режим.\n")
-        + "Платежи отключены, CT не имеют денежной стоимости.\n"
-        "Выбери раздел или отправь текст для теста.",
+        f"⚡ CRAFTTOKEN AI\n\nОдна платформа для идей, диалогов и творчества.\n\n"
+        f"💎 Твой баланс: {balance} CT\n"
+        "\n💬 Диалоги — общение с AI\n🎨 Студия — творческие инструменты\n🧠 Каталог — модели и их возможности\n👤 Профиль — твоя история и баланс\n\n"
+        + ("Закрытая бета · текстовый AI можно включить через /ai_on.\n" if available_routes(message.from_user.id) else "Закрытая бета · демонстрационный режим.\n")
+        + "Тестовые CT не имеют денежной стоимости. Оплата отключена.",
         reply_markup=menu(),
     )
 
@@ -90,20 +101,78 @@ async def start(message: types.Message):
 async def chat(message: types.Message):
     register(message.from_user)
     user_id = message.from_user.id
-    image_drafts.pop(user_id, None)
+    navigate(user_id, "chat")
     mode = db.mode(user_id)
     routes = available_routes(user_id)
     selected = routes.get(db.model_slot(user_id))
     await message.answer(
         f"💬 AI-диалоги\nРежим: {MODES[mode]}\n\n"
-        + (f"Модель: {model_name(selected)}\n/ai_on — включить, /ai_off — выключить." if selected else "Выбери доступную модель." if routes else "Демонстрационный режим: бесплатный тест интерфейса."),
+        + (f"Модель: {model_name(selected)}\nРеальный AI: {'включён' if db.ai_enabled(user_id) else 'выключен'}\n/ai_on — включить, /ai_off — выключить." if selected else "Выбери доступную модель." if routes else "Демонстрационный режим: бесплатный тест интерфейса."),
         reply_markup=chat_buttons(mode, user_id),
+    )
+
+
+def catalog_card(uid, category):
+    routes = available_routes(uid)
+    if category == "text":
+        lines = ["🧠 Каталог · Текст\n", "Mistral Nemo — диалоги, краткие ответы, переводы. " + ("Закрытый тест." if any(r.model == "mistral-nemo" for r in routes.values()) else "Демонстрация."), "GPT-OSS-20B — задачи с логикой и программированием. " + ("Маршрут настроен, ожидает проверки." if any(r.model == "gpt-oss-20b" for r in routes.values()) else "Планируется.")]
+        lines += ["\nВ разделе AI-диалоги можно выбрать подключённую модель."]
+    elif category == "image":
+        available = image_config and uid in image_config.testers and not db.image_trial_used(allow_retry=image_config.retry_once)
+        lines = ["🧠 Каталог · Изображения\n", "FLUX 3 Image Klein — создание изображений. " + ("Разовый закрытый тест." if available else "Демонстрация; платная генерация приостановлена."), "Редактирование фото — разработка.", "\nОткрой AI-студию для бесплатной проверки интерфейса."]
+    else:
+        lines = ["🧠 Каталог · Видео и музыка\n", "Видео — в планах.", "Музыка — в планах.", "\nРеальная генерация ещё не подключена."]
+    return "\n\n".join(lines)
+
+
+def catalog_buttons(category):
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text=("✓ " if category == key else "") + label, callback_data=f"catalog:{key}") for key, label in (("text", "Текст"), ("image", "Фото"), ("media", "Видео / музыка"))],
+    ])
+
+
+@router.message(F.text == CATALOG)
+@router.message(Command("models"))
+async def catalog(message: types.Message):
+    register(message.from_user)
+    uid = message.from_user.id
+    navigate(uid, "catalog")
+    await message.answer(catalog_card(uid, "text"), reply_markup=catalog_buttons("text"))
+
+
+@router.callback_query(F.data.in_({"catalog:text", "catalog:image", "catalog:media"}))
+async def catalog_tab(callback: types.CallbackQuery):
+    register(callback.from_user)
+    category = callback.data.split(":")[1]
+    navigate(callback.from_user.id, "catalog")
+    text = catalog_card(callback.from_user.id, category)
+    buttons = catalog_buttons(category)
+    await callback.answer()
+    if callback.message.text != text or callback.message.reply_markup != buttons:
+        await callback.message.edit_text(text, reply_markup=buttons)
+
+
+@router.message(F.text == PROFILE)
+@router.message(Command("profile"))
+async def profile(message: types.Message):
+    user = message.from_user
+    balance = register(user)
+    navigate(user.id, "profile")
+    stats = db.profile_stats(user.id)
+    selected = available_routes(user.id).get(db.model_slot(user.id))
+    live = bool(selected and db.ai_enabled(user.id))
+    await message.answer(
+        f"👤 Профиль CraftToken\n\n{user.full_name}\nID: {user.id}\n\n💎 Баланс: {balance} CT\n💬 Диалогов: {stats['dialogs']}\n🗂 Сохранённых запросов: {stats['requests']}\n\n"
+        + (f"Модель: {model_name(selected)}\n" if selected else "Доступ: демонстрационный\n")
+        + f"Текстовый AI: {'включён (закрытый тест)' if live else 'выключен'}\n\nCT — тестовые кредиты. Оплата ещё не подключена.",
+        reply_markup=menu(),
     )
 
 
 @router.callback_query(F.data.in_({"mode:fast", "mode:creative"}))
 async def select_mode(callback: types.CallbackQuery):
     register(callback.from_user)
+    navigate(callback.from_user.id, "chat")
     mode = callback.data.split(":")[1]
     db.set_mode(callback.from_user.id, mode)
     await callback.answer(f"Выбран {MODES[mode]}")
@@ -121,6 +190,7 @@ async def select_model(callback: types.CallbackQuery):
     if not config or user_id in busy:
         await callback.answer("Модель недоступна или выполняется запрос.", show_alert=True)
         return
+    navigate(user_id, "chat")
     changed = db.select_model(user_id, slot)
     await callback.answer(f"Выбрана {model_name(config)}")
     if not changed:
@@ -138,6 +208,7 @@ async def new_dialog(callback: types.CallbackQuery):
     if callback.from_user.id in busy:
         await callback.answer("Дождись завершения запроса.", show_alert=True)
         return
+    navigate(callback.from_user.id, "chat")
     db.new_dialog(callback.from_user.id)
     await callback.answer("Новый диалог создан")
     await callback.message.answer("Новый диалог. Отправь текст для теста.", reply_markup=menu())
@@ -147,14 +218,73 @@ async def new_dialog(callback: types.CallbackQuery):
 async def studio(message: types.Message):
     register(message.from_user)
     uid = message.from_user.id
-    image_drafts.pop(uid, None)
-    if not image_config or uid not in image_config.testers:
-        await message.answer("🎨 AI-студия\n\nГенерация изображений готовится к закрытому тесту. Редактирование фото пока недоступно.", reply_markup=menu())
+    navigate(uid, "studio")
+    live = image_config and uid in image_config.testers and not db.image_trial_used(allow_retry=image_config.retry_once)
+    await message.answer(
+        "🎨 CRAFTTOKEN STUDIO\n\nСоздавай, экспериментируй, собирай свои идеи.\n\n"
+        + ("Генерация: доступен отдельный платный тест.\n" if live else "Режим демонстрации · внешние запросы отключены.\n")
+        + "Выбери инструмент:",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="🖼 Создать изображение", callback_data="studio:draw")],
+            [types.InlineKeyboardButton(text="🪄 Редактировать фото", callback_data="studio:edit")],
+            [types.InlineKeyboardButton(text="🎬 Видео", callback_data="studio:video"), types.InlineKeyboardButton(text="🎵 Музыка", callback_data="studio:music")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.in_({"studio:draw", "studio:edit", "studio:video", "studio:music"}))
+async def studio_tool(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    register(callback.from_user)
+    key = callback.data.split(":")[1]
+    navigate(uid, "studio")
+    await callback.answer()
+    if key == "draw":
+        await callback.message.answer("🖼 Создание изображения\n\nПросто напиши идею одним сообщением.\nНапример: Город будущего на берегу моря\n\nВыберешь формат и увидишь параметры будущей генерации. Это бесплатная демонстрация, без отправки данных в AI.", reply_markup=menu())
+    else:
+        name = {"edit": "Редактирование фото", "video": "Генерация видео", "music": "Создание музыки"}[key]
+        await callback.message.answer(f"{name}\n\nЭтот инструмент в разработке. Файлы и запросы пока не отправляются внешним сервисам.", reply_markup=menu())
+
+
+@router.message(Command("preview"))
+async def preview_prompt(message: types.Message):
+    parts = (message.text or "").split(maxsplit=1)
+    await preview_text(message, parts[1] if len(parts) == 2 else "")
+
+
+async def preview_text(message: types.Message, prompt: str):
+    uid = message.from_user.id
+    register(message.from_user)
+    navigate(uid, "studio")
+    prompt = prompt.strip()
+    if not 1 <= len(prompt) <= 1000:
+        await message.answer("Напиши /preview и описание из 1–1000 символов одним сообщением.")
         return
-    if db.image_trial_used(allow_retry=image_config.retry_once):
-        await message.answer("🎨 AI-студия\n\nРазовый тест генерации уже использован. Проверяем расходы перед следующим запуском.", reply_markup=menu())
+    nonce = secrets.token_hex(8)
+    preview_drafts[uid] = (nonce, prompt, time.monotonic() + 300)
+    await message.answer("🖼 Настройка изображения · ДЕМО\n\nВыбери формат:", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+        types.InlineKeyboardButton(text=label, callback_data=f"preview:{key}:{nonce}") for key, label in (("square", "1:1"), ("wide", "16:9"), ("tall", "9:16"))
+    ]] + [[types.InlineKeyboardButton(text="Отмена", callback_data=f"preview:cancel:{nonce}")]]))
+
+
+@router.callback_query(F.data.startswith("preview:"))
+async def preview_format(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    draft = preview_drafts.get(uid)
+    parts = callback.data.split(":")
+    ratios = {"square": "1:1", "wide": "16:9", "tall": "9:16"}
+    if len(parts) != 3 or not draft or draft[0] != parts[2] or time.monotonic() > draft[2]:
+        await callback.answer("Демонстрация устарела.", show_alert=True)
         return
-    await message.answer("🎨 AI-студия\n\nFLUX 3 Image Klein · текст в изображение\n768 · 1:1 · одна картинка\n\nНапиши /image и описание картинки одним сообщением.\nНапример: /image Кот-космонавт на Луне\n\nЗатем подтверди платный тест. Редактирование фото пока недоступно.", reply_markup=menu())
+    if parts[1] not in {*ratios, "cancel"}:
+        await callback.answer("Кнопка недоступна.", show_alert=True)
+        return
+    preview_drafts.pop(uid, None)
+    await callback.answer()
+    if parts[1] == "cancel":
+        await callback.message.edit_text("Демонстрация отменена.")
+        return
+    await callback.message.edit_text(f"✅ Параметры подготовлены · ДЕМО\n\nИдея: {draft[1]}\nФормат: {ratios[parts[1]]}\nМодель: FLUX 3 Image Klein (запланирована)\n\nИзображение не создано. Данные не отправлялись, CT не списаны.")
 
 
 @router.message(Command("image"))
@@ -163,7 +293,7 @@ async def image_prompt(message: types.Message):
     register(message.from_user)
     image_drafts.pop(uid, None)
     if not image_config or uid not in image_config.testers:
-        await message.answer("Генерация пока доступна только участникам закрытого теста.")
+        await preview_prompt(message)
         return
     if db.image_trial_used(allow_retry=image_config.retry_once) or uid in busy:
         await message.answer("Тест уже использован или выполняется запрос. Проверь AI-студию.")
@@ -226,6 +356,7 @@ async def image_confirm(callback: types.CallbackQuery):
 @router.message(Command("balance"))
 async def wallet(message: types.Message):
     balance = register(message.from_user)
+    navigate(message.from_user.id, "wallet")
     entries = db.ledger(message.from_user.id)
     operations = "\n".join(f"{r['amount']:+d} CT — {r['reason']}" for r in entries)
     await message.answer(
@@ -239,6 +370,7 @@ async def wallet(message: types.Message):
 @router.message(F.text == HISTORY)
 async def history(message: types.Message):
     register(message.from_user)
+    navigate(message.from_user.id, "history")
     prompts = db.recent_prompts(message.from_user.id)
     lines = [f"• {r['content'][:180]}" for r in prompts]
     await message.answer(
@@ -275,11 +407,13 @@ async def confirm_clear(callback: types.CallbackQuery):
 @router.message(Command("help"))
 async def help_message(message: types.Message):
     register(message.from_user)
+    navigate(message.from_user.id, "help")
     contact = os.getenv("SUPPORT_CONTACT", "").strip()
     await message.answer(
         "🛟 Помощь\n\n/menu — главное меню\n/balance — баланс\n"
         "/clear_history — удалить историю из базы бота\n\n"
         "/ai_on — включить реальный AI (для тестировщиков)\n/ai_off — выключить AI\n"
+        "/models — каталог\n/profile — профиль\n/preview — тест интерфейса изображений\n"
         "Запросы сохраняются в базе. При включённом AI текст и контекст отправляются GetAPI и его провайдеру. Не отправляй пароли и личные данные. "
         "Удаление в боте не удаляет сообщения из Telegram.\n" +
         (f"Поддержка: {contact}" if contact else "Контакт поддержки ещё не настроен."),
@@ -316,6 +450,7 @@ async def enable_ai(message: types.Message):
     if not config:
         await message.answer("Реальный AI пока доступен только участникам закрытого теста.")
         return
+    navigate(user_id, "chat")
     await message.answer(
         "Включить AI? Текст запроса и до 6 предыдущих AI-сообщений будут передаваться "
         f"GetAPI и поставщику {', '.join(config.providers)} (модель {model_name(config)}). Данные могут обрабатываться по их правилам. "
@@ -364,10 +499,17 @@ async def unknown_command(message: types.Message):
 @router.message(F.text)
 async def demo(message: types.Message):
     register(message.from_user)
+    user_id = message.from_user.id
+    section = db.section(user_id)
+    if section == "studio":
+        await preview_text(message, message.text)
+        return
+    if section != "chat":
+        await message.answer("Выбери 💬 AI-диалоги для общения или 🎨 AI-студию для творчества.", reply_markup=menu())
+        return
     if len(message.text) > 3000:
         await message.answer("Для теста отправь не более 3000 символов.")
         return
-    user_id = message.from_user.id
     mode = db.mode(user_id)
     config = available_routes(user_id).get(db.model_slot(user_id))
     if config and db.ai_enabled(user_id):
@@ -414,7 +556,8 @@ async def old_button(callback: types.CallbackQuery):
 async def main():
     global ai_config, image_config
     ai_config = AIConfig.from_env()
-    image_config = ImageConfig.from_env(ai_config)
+    # Product development: pause paid images until explicitly enabled again.
+    image_config = ImageConfig.from_env(ai_config) if os.getenv("GETAPI_IMAGE_LIVE_ENABLED") == "1" else None
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Set BOT_TOKEN in the environment")
