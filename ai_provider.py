@@ -1,35 +1,3 @@
-"""GetAPI integration with explicitly opted-in, capped trial routes."""
-import os
-import re
-from dataclasses import dataclass, field
-
-import aiohttp
-
-URL = "https://api.getapi.ru/v1/chat/completions"
-
-
-class AIError(Exception):
-    """A safe, user-facing error; never include credentials or raw API body."""
-
-
-@dataclass(frozen=True)
-class AIConfig:
-    api_key: str = field(repr=False)
-    model: str
-    providers: tuple[str, ...]
-    testers: frozenset[int]
-    trial: bool = False
-
-    @classmethod
-    def from_env(cls):
-        key = os.getenv("GETAPI_API_KEY", "").strip()
-        if not key:
-            return None
-        model = os.getenv("GETAPI_MODEL", "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,150}", model):
-            raise ValueError("GETAPI_MODEL must be an explicit catalog model ID")
-        providers = tuple(x.strip() for x in os.getenv("GETAPI_PROVIDERS", "").split(",") if x.strip())
-        if not providers:
             raise ValueError("GETAPI_PROVIDERS must name approved model providers")
         try:
             testers = frozenset(int(x) for x in os.getenv("TEST_USER_IDS", "").split(",") if x.strip())
@@ -45,10 +13,18 @@ class AIConfig:
 
 
 def request_body(config: AIConfig, mode: str, context: list[dict], prompt: str):
+    identity = (
+        "Ты универсальный текстовый AI-ассистент в Telegram-сервисе CraftToken AI. "
+        "CraftToken — название сервиса, а не задача по созданию токенов или криптовалют. "
+        "Помогай с вопросами, текстами, идеями, переводом и объяснениями. "
+        "Не утверждай, что можешь выполнять внешние действия, создавать файлы, "
+        "генерировать изображения или пользоваться инструментами, которых у тебя нет. "
+        "Отвечай на языке пользователя. "
+    )
     instruction = (
-        "Ты ассистент CraftToken. Отвечай ясно и кратко, на языке пользователя."
+        identity + "Отвечай ясно, кратко и по существу."
         if mode == "fast" else
-        "Ты творческий ассистент CraftToken. Предлагай оригинальные идеи, отвечай на языке пользователя."
+        identity + "Предлагай оригинальные идеи и варианты, когда это полезно."
     )
     ceiling = 0.05 if config.trial else 0
     return {
