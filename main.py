@@ -151,7 +151,7 @@ async def studio(message: types.Message):
     if not image_config or uid not in image_config.testers:
         await message.answer("🎨 AI-студия\n\nГенерация изображений готовится к закрытому тесту. Редактирование фото пока недоступно.", reply_markup=menu())
         return
-    if db.image_trial_used():
+    if db.image_trial_used(allow_retry=image_config.retry_once):
         await message.answer("🎨 AI-студия\n\nРазовый тест генерации уже использован. Проверяем расходы перед следующим запуском.", reply_markup=menu())
         return
     await message.answer("🎨 AI-студия\n\nFLUX 3 Image Klein · текст в изображение\n768 · 1:1 · одна картинка\n\nНапиши /image и описание картинки одним сообщением.\nНапример: /image Кот-космонавт на Луне\n\nЗатем подтверди платный тест. Редактирование фото пока недоступно.", reply_markup=menu())
@@ -165,7 +165,7 @@ async def image_prompt(message: types.Message):
     if not image_config or uid not in image_config.testers:
         await message.answer("Генерация пока доступна только участникам закрытого теста.")
         return
-    if db.image_trial_used() or uid in busy:
+    if db.image_trial_used(allow_retry=image_config.retry_once) or uid in busy:
         await message.answer("Тест уже использован или выполняется запрос. Проверь AI-студию.")
         return
     parts = (message.text or "").split(maxsplit=1)
@@ -204,7 +204,7 @@ async def image_confirm(callback: types.CallbackQuery):
         await callback.answer("Отменено")
         await callback.message.edit_text("Генерация отменена. Запрос не отправлен.")
         return
-    if not image_config or uid not in image_config.testers or uid in busy or not db.reserve_image_trial(uid):
+    if not image_config or uid not in image_config.testers or uid in busy or not db.reserve_image_trial(uid, allow_retry=image_config.retry_once):
         await callback.answer("Тест недоступен или уже использован.", show_alert=True)
         return
     busy.add(uid)
