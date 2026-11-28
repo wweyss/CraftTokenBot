@@ -2,13 +2,17 @@
 import asyncio
 import logging
 import os
+import secrets
+import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command, CommandStart
+from aiogram.exceptions import TelegramAPIError
 
 from database import Database
 from ai_provider import AIConfig, AIError, generate
+from image_provider import ImageConfig, generate_image
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -16,6 +20,8 @@ router.message.filter(F.chat.type == "private")
 router.callback_query.filter(F.message.chat.type == "private")
 db = Database(os.getenv("DB_PATH") or str(Path(os.getenv("DATA_DIR", ".")) / "bot_database.db"))
 ai_config = None
+image_config = None
+image_drafts = {}
 busy = set()
 
 CHAT = "💬 AI-диалоги"
@@ -61,6 +67,7 @@ def register(user):
 
 
 async def welcome(message):
+    image_drafts.pop(message.from_user.id, None)
     balance = register(message.from_user)
     await message.answer(
         f"⚡ CraftToken AI\n\nТвой персональный набор AI-инструментов.\n"
@@ -83,6 +90,7 @@ async def start(message: types.Message):
 async def chat(message: types.Message):
     register(message.from_user)
     user_id = message.from_user.id
+    image_drafts.pop(user_id, None)
     mode = db.mode(user_id)
     routes = available_routes(user_id)
     selected = routes.get(db.model_slot(user_id))
@@ -138,11 +146,80 @@ async def new_dialog(callback: types.CallbackQuery):
 @router.message(F.text == STUDIO)
 async def studio(message: types.Message):
     register(message.from_user)
+    uid = message.from_user.id
+    image_drafts.pop(uid, None)
+    if not image_config or uid not in image_config.testers:
+        await message.answer("🎨 AI-студия\n\nГенерация изображений готовится к закрытому тесту. Редактирование фото пока недоступно.", reply_markup=menu())
+        return
+    if db.image_trial_used():
+        await message.answer("🎨 AI-студия\n\nРазовый тест генерации уже использован. Проверяем расходы перед следующим запуском.", reply_markup=menu())
+        return
+    await message.answer("🎨 AI-студия\n\nFLUX 3 Image Klein · текст в изображение\n768 · 1:1 · одна картинка\n\nНапиши /image и описание картинки одним сообщением.\nНапример: /image Кот-космонавт на Луне\n\nЗатем подтверди платный тест. Редактирование фото пока недоступно.", reply_markup=menu())
+
+
+@router.message(Command("image"))
+async def image_prompt(message: types.Message):
+    uid = message.from_user.id
+    register(message.from_user)
+    image_drafts.pop(uid, None)
+    if not image_config or uid not in image_config.testers:
+        await message.answer("Генерация пока доступна только участникам закрытого теста.")
+        return
+    if db.image_trial_used() or uid in busy:
+        await message.answer("Тест уже использован или выполняется запрос. Проверь AI-студию.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    prompt = parts[1].strip() if len(parts) == 2 else ""
+    if not 1 <= len(prompt) <= 1000:
+        await message.answer("Напиши /image и описание из 1–1000 символов одним сообщением.")
+        return
+    nonce = secrets.token_hex(8)
+    image_drafts[uid] = (nonce, prompt, time.monotonic() + 300)
     await message.answer(
-        "🎨 AI-студия\n\nВ разработке: генерация изображений и редактирование фото. "
-        "В текущей версии файлы не отправляются внешним сервисам.",
-        reply_markup=menu(),
+        "Создать 1 изображение FLUX 3 Image Klein (768, 1:1)?\n\n"
+        f"Описание: {prompt}\n\n"
+        "Платный разовый тест: цена зависит от GetAPI; ориентир от 0,95 ₽. CT не списываются. "
+        "Текст будет отправлен GetAPI и Black Forest Labs. Не включай личные данные. "
+        "Даже неудачная попытка расходует тестовый лимит; автоматического повтора нет.",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(text="Создать (1 попытка)", callback_data=f"image:run:{nonce}"),
+            types.InlineKeyboardButton(text="Отмена", callback_data=f"image:cancel:{nonce}"),
+        ]]),
     )
+
+
+@router.callback_query(F.data.startswith("image:"))
+async def image_confirm(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    draft = image_drafts.get(uid)
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not draft or draft[0] != parts[2] or time.monotonic() > draft[2]:
+        await callback.answer("Подтверждение устарело. Открой AI-студию.", show_alert=True)
+        return
+    if parts[1] not in ("run", "cancel"):
+        await callback.answer("Кнопка недоступна.", show_alert=True)
+        return
+    image_drafts.pop(uid, None)
+    if parts[1] == "cancel":
+        await callback.answer("Отменено")
+        await callback.message.edit_text("Генерация отменена. Запрос не отправлен.")
+        return
+    if not image_config or uid not in image_config.testers or uid in busy or not db.reserve_image_trial(uid):
+        await callback.answer("Тест недоступен или уже использован.", show_alert=True)
+        return
+    busy.add(uid)
+    try:
+        await callback.answer()
+        await callback.message.edit_text("⏳ FLUX создаёт изображение. Повторных платных запросов не будет.")
+        result = await generate_image(image_config, draft[1])
+        photo = types.BufferedInputFile(result.data, filename=result.filename) if result.data is not None else result.url
+        await callback.message.answer_photo(photo=photo, caption="🎨 FLUX 3 Image Klein · тестовая генерация", reply_markup=menu())
+    except AIError as error:
+        await callback.message.answer(str(error), reply_markup=menu())
+    except TelegramAPIError:
+        await callback.message.answer("Не удалось доставить картинку. Проверь журнал GetAPI; повторного запроса не будет.", reply_markup=menu())
+    finally:
+        busy.discard(uid)
 
 
 @router.message(F.text == WALLET)
@@ -335,8 +412,9 @@ async def old_button(callback: types.CallbackQuery):
 
 
 async def main():
-    global ai_config
+    global ai_config, image_config
     ai_config = AIConfig.from_env()
+    image_config = ImageConfig.from_env(ai_config)
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Set BOT_TOKEN in the environment")

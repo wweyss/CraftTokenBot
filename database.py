@@ -45,6 +45,10 @@ class Database:
                     id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(user_id),
                     at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS image_trial (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    user_id INTEGER NOT NULL REFERENCES users(user_id), at INTEGER NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS ai_attempt_time ON ai_attempts(at);
                 CREATE INDEX IF NOT EXISTS ledger_user ON ledger(user_id, id);
                 CREATE INDEX IF NOT EXISTS dialog_user ON dialogs(user_id, id);
@@ -180,3 +184,13 @@ class Database:
                 return False
             db.execute("INSERT INTO ai_attempts(user_id, at) VALUES (?, ?)", (user_id, now))
             return True
+
+    def image_trial_used(self) -> bool:
+        with self.connect() as db:
+            return db.execute("SELECT 1 FROM image_trial WHERE id=1").fetchone() is not None
+
+    def reserve_image_trial(self, user_id: int) -> bool:
+        """One paid image attempt per test database, including failures."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return bool(db.execute("INSERT OR IGNORE INTO image_trial(id, user_id, at) VALUES (1, ?, ?)", (user_id, int(time.time()))).rowcount)
